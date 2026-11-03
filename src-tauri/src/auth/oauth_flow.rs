@@ -484,7 +484,7 @@ mod tests {
         use axum::http::HeaderMap;
 
         let oauth = OAuthRuntime::new(
-            "https://lb.example.com".into(),
+            "https://lb.example.com",
             "chatgpt-client-test".into(),
             None,
             "test-password".into(),
