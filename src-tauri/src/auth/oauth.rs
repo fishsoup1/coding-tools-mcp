@@ -118,22 +118,15 @@ impl AuthConfig {
 /// Resolve the external OAuth/MCP base URL for a request.
 ///
 /// A configured or runtime-updated URL always wins. Without one, only loopback
-/// `Host` values are trusted; arbitrary external `Host`/`X-Forwarded-Host`
-/// headers must not be able to redefine the OAuth issuer and token audience.
+/// `Host` values are trusted; arbitrary external `Host`/`X-Forwarded-Host`/
+/// `X-Forwarded-Proto` headers must not be able to redefine the OAuth issuer
+/// and token audience.
 pub fn external_base_url(headers: &HeaderMap, bind_port: u16, configured_url: &str) -> String {
     let configured = normalize_public_url(configured_url);
     if !configured.is_empty() {
         return configured;
     }
 
-    let proto = {
-        let value = first_header_value(headers, "x-forwarded-proto");
-        if value.is_empty() {
-            forwarded_header_param(headers, "proto")
-        } else {
-            value
-        }
-    };
     let host = {
         let value = safe_external_host(&first_header_value(headers, "x-forwarded-host"));
         if !value.is_empty() {
@@ -153,15 +146,10 @@ pub fn external_base_url(headers: &HeaderMap, bind_port: u16, configured_url: &s
     } else {
         host
     };
-    let proto = resolve_external_proto(
-        if proto.is_empty() {
-            None
-        } else {
-            Some(proto.as_str())
-        },
-        &host,
-    );
-    format!("{proto}://{host}")
+    // No authoritative URL and no trusted external host means the local
+    // listener is being addressed directly, so it serves plain HTTP. Ignoring
+    // `X-Forwarded-Proto` here keeps spoofed headers out of the issuer.
+    format!("http://{host}")
 }
 
 fn first_header_value(headers: &HeaderMap, name: &str) -> String {
@@ -208,24 +196,6 @@ fn host_without_port(host: &str) -> &str {
     host.rsplit_once(':')
         .map(|(value, _)| value)
         .unwrap_or(host)
-}
-
-fn resolve_external_proto(proto: Option<&str>, host: &str) -> &'static str {
-    if let Some(proto) = proto {
-        let proto = proto.trim().to_ascii_lowercase();
-        if proto == "http" {
-            return "http";
-        }
-        if proto == "https" {
-            return "https";
-        }
-    }
-
-    if is_loopback_host(host_without_port(host)) {
-        "http"
-    } else {
-        "https"
-    }
 }
 
 fn is_loopback_host(host: &str) -> bool {
