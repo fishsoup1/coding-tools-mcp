@@ -376,6 +376,23 @@ impl TunnelSupervisor {
         public_url_for_profile(profile, kind, settings)
     }
 
+    /// URL of the tunnel that is alive right now, without falling back to the
+    /// last persisted profile value.
+    pub fn running_public_url(
+        &self,
+        workspace_id: &str,
+        kind: TunnelServiceKind,
+    ) -> Option<String> {
+        let key = (workspace_id.to_string(), kind);
+        if !self.session_is_running(&key) {
+            return None;
+        }
+        self.sessions
+            .get(&key)
+            .map(|session| session.public_url.clone())
+            .filter(|url| !url.is_empty())
+    }
+
     pub fn route_profile(
         &self,
         workspace_id: &str,
@@ -1382,6 +1399,65 @@ mod tests {
         assert_eq!(
             supervisor.sessions.get(&second_key).and_then(|s| s.pid),
             Some(99)
+        );
+    }
+
+    #[tokio::test]
+    async fn restarting_a_runtime_keeps_an_already_live_quick_tunnel() {
+        let mut profile = WorkspaceProfile::new("C:/workspace/quick".into(), Some("quick".into()));
+        profile.tunnel.tunnel_type = "cloudflare".into();
+        profile.tunnel.cloudflare_mode = "quick".into();
+        let key = (profile.id.clone(), TunnelServiceKind::Mcp);
+        let mut supervisor = TunnelSupervisor::new();
+        supervisor.sessions.insert(
+            key.clone(),
+            TunnelSession {
+                public_url: "https://old.trycloudflare.com".into(),
+                pid: Some(std::process::id()),
+                child: None,
+            },
+        );
+
+        let status = supervisor
+            .start(&profile, TunnelServiceKind::Mcp, &AppSettings::default())
+            .await
+            .expect("start");
+
+        assert_eq!(status.public_url, "https://old.trycloudflare.com");
+        assert_eq!(supervisor.sessions.len(), 1);
+    }
+
+    #[test]
+    fn running_public_url_tracks_live_sessions_and_domain_changes() {
+        let profile = WorkspaceProfile::new("C:/workspace/tunnel".into(), Some("tunnel".into()));
+        let key = (profile.id.clone(), TunnelServiceKind::Mcp);
+        let mut supervisor = TunnelSupervisor::new();
+        assert_eq!(
+            supervisor.running_public_url(&profile.id, TunnelServiceKind::Mcp),
+            None
+        );
+
+        supervisor.sessions.insert(
+            key.clone(),
+            TunnelSession {
+                public_url: "https://old.trycloudflare.com".into(),
+                pid: Some(std::process::id()),
+                child: None,
+            },
+        );
+        assert_eq!(
+            supervisor.running_public_url(&profile.id, TunnelServiceKind::Mcp),
+            Some("https://old.trycloudflare.com".into())
+        );
+
+        supervisor
+            .sessions
+            .get_mut(&key)
+            .expect("session")
+            .public_url = "https://new.trycloudflare.com".into();
+        assert_eq!(
+            supervisor.running_public_url(&profile.id, TunnelServiceKind::Mcp),
+            Some("https://new.trycloudflare.com".into())
         );
     }
 }

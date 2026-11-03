@@ -29,7 +29,9 @@ fn validate_tunnel_start_resources(
     state.with_workspaces(|store| validate_service_start(store.list(), id, service))
 }
 
-fn persist_public_url(
+/// Persist the tunnel's live URL and, for MCP, push it into the running
+/// listener so OAuth metadata follows a rotated Quick Tunnel hostname.
+fn apply_public_url(
     state: &AppState,
     id: &str,
     kind: TunnelServiceKind,
@@ -48,7 +50,14 @@ fn persist_public_url(
         }
         store.update(profile)?;
         Ok(())
-    })
+    })?;
+    if kind == TunnelServiceKind::Mcp {
+        state.with_runtime(|runtime| {
+            runtime.set_mcp_public_url(id, public_url);
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 async fn sync_tunnel_routes_from_runtime(state: &AppState) -> AppResult<()> {
@@ -200,7 +209,7 @@ pub async fn restart_tunnel(
         }
     };
 
-    persist_public_url(&state, &id, kind, &status.public_url)?;
+    apply_public_url(&state, &id, kind, &status.public_url)?;
     Ok(status)
 }
 
@@ -221,7 +230,7 @@ pub async fn start_tunnel(
         guard.start(&profile, kind, &settings).await?
     };
 
-    persist_public_url(&state, &id, kind, &status.public_url)?;
+    apply_public_url(&state, &id, kind, &status.public_url)?;
     Ok(status)
 }
 
@@ -321,7 +330,7 @@ pub async fn test_tunnel(
     let keep_tunnel = runtime_running;
 
     if keep_tunnel {
-        persist_public_url(&state, &id, kind, &public_url)?;
+        apply_public_url(&state, &id, kind, &public_url)?;
         return Ok(TunnelTestResult {
             success: !public_url.is_empty() || status.state == "running",
             public_url,

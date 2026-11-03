@@ -16,7 +16,7 @@ use crate::audit::request_context_from_headers;
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
     protected_resource_metadata, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
-    AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
+    AuthorizeForm, AuthorizeParams, OAuthRuntime, PublicBaseUrl, TokenForm,
 };
 use crate::mcp::server::{handle_request_with_context, new_state, SharedState};
 use crate::mcp::upstream::UpstreamMcpManager;
@@ -35,10 +35,16 @@ struct ListenerState {
     workspace_id: String,
     workspace_path: String,
     bind_port: u16,
-    configured_public_url: String,
+    public_url: PublicBaseUrl,
     bearer_token: Option<String>,
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
+}
+
+pub struct ListenerHandle {
+    pub shutdown: ShutdownSender,
+    pub public_url: PublicBaseUrl,
+    pub join: tauri::async_runtime::JoinHandle<()>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53,7 +59,7 @@ pub fn spawn_listener(
     oauth_token_secret: Option<String>,
     runtime: RuntimeConfig,
     upstream: Arc<UpstreamMcpManager>,
-) -> Result<(ShutdownSender, tauri::async_runtime::JoinHandle<()>), String> {
+) -> Result<ListenerHandle, String> {
     let workspace_display = workspace_path.display().to_string();
     let workspace = Workspace::new(workspace_path).map_err(|e| e.message())?;
     if matches!(
@@ -91,17 +97,14 @@ pub fn spawn_listener(
     } else {
         None
     };
-    let configured_public_url = public_base_url.trim().to_string();
+    let public_url = PublicBaseUrl::new(public_base_url);
     let oauth = if auth.oauth_enabled() {
         let password = oauth_password.unwrap_or_default();
         let token_secret = oauth_token_secret.unwrap_or_default();
-        let oauth_base = external_base_url(
-            &HeaderMap::new(),
-            port,
-            &configured_public_url,
-        );
+        // Share the URL handle with the listener so a Quick Tunnel domain change
+        // can update OAuth metadata without restarting the listener.
         Some(Arc::new(OAuthRuntime::new(
-            oauth_base,
+            public_url.clone(),
             auth.oauth_client_id.clone(),
             oauth_client_secret.clone(),
             password,
@@ -116,7 +119,7 @@ pub fn spawn_listener(
         workspace_id,
         workspace_path: workspace_display,
         bind_port: port,
-        configured_public_url,
+        public_url: public_url.clone(),
         bearer_token,
         oauth,
         oauth_client_secret,
@@ -136,7 +139,11 @@ pub fn spawn_listener(
             append_profile_log(&profile_id, "stderr.log", "[mcp] listener stopped");
         }
     });
-    Ok((shutdown_tx, handle))
+    Ok(ListenerHandle {
+        shutdown: shutdown_tx,
+        public_url,
+        join: handle,
+    })
 }
 
 async fn serve(
@@ -209,7 +216,15 @@ fn mcp_discovery_payload() -> Value {
 }
 
 fn resolve_oauth_base(state: &ListenerState, headers: &HeaderMap) -> String {
-    external_base_url(headers, state.bind_port, &state.configured_public_url)
+    resolve_oauth_base_from(&state.public_url, state.bind_port, headers)
+}
+
+fn resolve_oauth_base_from(
+    public_url: &PublicBaseUrl,
+    bind_port: u16,
+    headers: &HeaderMap,
+) -> String {
+    external_base_url(headers, bind_port, &public_url.current())
 }
 
 async fn mcp_post(
@@ -450,9 +465,16 @@ fn oauth_not_configured() -> Response {
 #[cfg(test)]
 mod tests {
     use axum::http::header::CACHE_CONTROL;
+    use axum::http::HeaderMap;
     use axum::response::IntoResponse;
 
-    use super::{bind_listener, mcp_discovery, mcp_discovery_payload};
+    use super::{
+        bind_listener, mcp_discovery, mcp_discovery_payload, resolve_oauth_base_from, spawn_listener,
+    };
+    use crate::auth::PublicBaseUrl;
+    use crate::mcp::upstream::UpstreamMcpManager;
+    use crate::workspace::{AuthConfig, RuntimeConfig};
+    use std::sync::Arc;
 
     #[test]
     fn bind_listener_reports_port_conflict_synchronously() {
@@ -474,5 +496,92 @@ mod tests {
         let response = mcp_discovery().await.into_response();
 
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn oauth_base_prefers_the_synced_tunnel_url_over_host_headers() {
+        let public_url = PublicBaseUrl::new("https://old.trycloudflare.com");
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "evil.example.com".parse().unwrap());
+
+        assert_eq!(
+            resolve_oauth_base_from(&public_url, 28766, &headers),
+            "https://old.trycloudflare.com"
+        );
+
+        public_url.set("https://new.trycloudflare.com");
+        assert_eq!(
+            resolve_oauth_base_from(&public_url, 28766, &headers),
+            "https://new.trycloudflare.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_metadata_endpoint_follows_a_tunnel_domain_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let port = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("pick port");
+            listener.local_addr().expect("local addr").port()
+        };
+        let handle = spawn_listener(
+            port,
+            dir.path().to_path_buf(),
+            "workspace-test".into(),
+            AuthConfig::default(),
+            "https://old.trycloudflare.com".into(),
+            None,
+            Some("password".into()),
+            Some("token-secret".into()),
+            RuntimeConfig::default(),
+            Arc::new(UpstreamMcpManager::empty()),
+        )
+        .expect("spawn listener");
+
+        let metadata_url = format!(
+            "http://127.0.0.1:{port}/.well-known/oauth-authorization-server"
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("http client");
+        let metadata = fetch_metadata(&client, &metadata_url).await;
+        assert_eq!(metadata["issuer"], "https://old.trycloudflare.com");
+
+        // The Host header cannot redirect OAuth metadata away from the live URL.
+        let spoofed = client
+            .get(&metadata_url)
+            .header("host", "evil.example.com")
+            .send()
+            .await
+            .expect("spoofed request");
+        let spoofed: serde_json::Value = spoofed.json().await.expect("spoofed json");
+        assert_eq!(spoofed["issuer"], "https://old.trycloudflare.com");
+
+        handle.public_url.set("https://new.trycloudflare.com");
+        let metadata = fetch_metadata(&client, &metadata_url).await;
+        assert_eq!(metadata["issuer"], "https://new.trycloudflare.com");
+        assert_eq!(
+            metadata["authorization_endpoint"],
+            "https://new.trycloudflare.com/oauth/authorize"
+        );
+        assert_eq!(
+            metadata["token_endpoint"],
+            "https://new.trycloudflare.com/oauth/token"
+        );
+
+        let _ = handle.shutdown.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join).await;
+    }
+
+    async fn fetch_metadata(client: &reqwest::Client, url: &str) -> serde_json::Value {
+        for _ in 0..100 {
+            if let Ok(response) = client.get(url).send().await {
+                if response.status().is_success() {
+                    return response.json().await.expect("metadata json");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("listener did not become ready");
     }
 }

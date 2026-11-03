@@ -96,6 +96,19 @@ pub async fn stop_for_runtime(
     guard.stop(profile, kind, &settings).await
 }
 
+/// URL of the tunnel that is currently alive, if any.
+///
+/// This is the authoritative address for OAuth metadata and the GPT
+/// configuration copy; the persisted profile URL can lag behind a Quick Tunnel
+/// that rotated its hostname.
+pub async fn current_running_url(
+    workspace_id: &str,
+    kind: TunnelServiceKind,
+) -> Option<String> {
+    let guard = supervisor().lock().await;
+    guard.running_public_url(workspace_id, kind)
+}
+
 pub async fn drop_workspace(workspace_id: &str) -> AppResult<()> {
     let mut guard = supervisor().lock().await;
     guard.drop_workspace(workspace_id).await

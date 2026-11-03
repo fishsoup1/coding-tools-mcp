@@ -9,9 +9,9 @@ use crate::settings::AppSettings;
 use crate::workspace::WorkspaceProfile;
 
 pub use access::{
-    cleanup_orphan_for_runtime, drop_workspace, ensure_frp_health_loop, maybe_start_for_runtime,
-    stop_for_runtime, supervisor, sync_managed_runtime_routes, terminate_children_on_exit,
-    terminate_recorded_tunnel_children_on_startup,
+    cleanup_orphan_for_runtime, current_running_url, drop_workspace, ensure_frp_health_loop,
+    maybe_start_for_runtime, stop_for_runtime, supervisor, sync_managed_runtime_routes,
+    terminate_children_on_exit, terminate_recorded_tunnel_children_on_startup,
 };
 
 #[allow(unused_imports)]

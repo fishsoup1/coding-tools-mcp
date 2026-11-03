@@ -11,6 +11,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::bearer::constant_time_eq_str;
+use super::oauth::PublicBaseUrl;
 
 pub const OAUTH_CODE_TTL_SECONDS: u64 = 300;
 pub const OAUTH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
@@ -23,6 +24,7 @@ pub struct OAuthRuntime {
     pub client_secret: Option<String>,
     pub password: String,
     pub token_secret: String,
+    base_urls: PublicBaseUrl,
     pending: Arc<Mutex<HashMap<String, PendingCode>>>,
 }
 
@@ -48,7 +50,7 @@ struct TokenClaims {
 
 impl OAuthRuntime {
     pub fn new(
-        _base_url: String,
+        base_url: impl Into<PublicBaseUrl>,
         client_id: String,
         client_secret: Option<String>,
         password: String,
@@ -59,8 +61,18 @@ impl OAuthRuntime {
             client_secret,
             password,
             token_secret,
+            base_urls: base_url.into(),
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Follow the tunnel URL that is serving right now.
+    pub fn set_base_url(&self, url: &str) -> bool {
+        self.base_urls.set(url)
+    }
+
+    pub fn current_base_url(&self) -> String {
+        self.base_urls.current()
     }
 
     pub fn client_id_allowed(&self, client_id: &str) -> bool {
@@ -85,6 +97,14 @@ impl OAuthRuntime {
         )
         .is_ok()
     }
+
+    /// Accept tokens minted for the current or a recently retired public URL.
+    pub fn verify_access_token_across_urls(&self, token: &str) -> bool {
+        self.base_urls
+            .accepted()
+            .iter()
+            .any(|url| self.verify_access_token(token, url))
+    }
 }
 
 pub fn verify_oauth_bearer_header(
@@ -101,7 +121,9 @@ pub fn verify_oauth_bearer_header(
     let Some(token) = header_str.strip_prefix("Bearer ").map(str::trim) else {
         return Some((StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response());
     };
-    if oauth.verify_access_token(token, server_url) {
+    if oauth.verify_access_token(token, server_url)
+        || oauth.verify_access_token_across_urls(token)
+    {
         None
     } else {
         Some((StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response())
@@ -294,10 +316,16 @@ pub fn token_exchange(
         return token_error("invalid_grant", "PKCE verification failed");
     }
 
-    let issuer = if code_data.server_url.trim().is_empty() {
-        server_url.trim_end_matches('/').to_string()
-    } else {
+    // The tunnel domain may have changed between authorize and token exchange.
+    // Mint against the URL that is live now; fall back to the request/code URL
+    // only when no runtime URL has been configured (local-only listener).
+    let current = oauth.current_base_url();
+    let issuer = if !current.is_empty() {
+        current
+    } else if !code_data.server_url.trim().is_empty() {
         code_data.server_url.trim_end_matches('/').to_string()
+    } else {
+        server_url.trim_end_matches('/').to_string()
     };
     match create_access_token(&issuer, &oauth.token_secret, OAUTH_TOKEN_TTL_SECONDS) {
         Ok(access_token) => (
@@ -449,6 +477,7 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn token_exchange_without_client_secret() {
@@ -503,5 +532,100 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92Kpru-AEJvkQlLgi3ThpmQ45N_Xyo";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         assert!(verify_pkce(verifier, &challenge));
+    }
+
+    #[test]
+    fn access_tokens_survive_a_tunnel_domain_change() {
+        let oauth = OAuthRuntime::new(
+            "https://old.trycloudflare.com",
+            "chatgpt-client-test".into(),
+            None,
+            "test-password".into(),
+            "token-signing-secret".into(),
+        );
+        let token = create_access_token(
+            "https://old.trycloudflare.com",
+            "token-signing-secret",
+            OAUTH_TOKEN_TTL_SECONDS,
+        )
+        .expect("token");
+        assert!(oauth.verify_access_token(&token, "https://old.trycloudflare.com"));
+
+        assert!(oauth.set_base_url("https://new.trycloudflare.com"));
+
+        assert!(oauth.verify_access_token_across_urls(&token));
+        assert!(!oauth.verify_access_token(&token, "https://new.trycloudflare.com"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("authorization header"),
+        );
+        assert!(
+            verify_oauth_bearer_header(&headers, &oauth, "https://new.trycloudflare.com").is_none(),
+            "existing grant must keep working after the tunnel domain changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_exchange_after_domain_change_uses_the_live_url() {
+        let oauth = OAuthRuntime::new(
+            "https://old.trycloudflare.com",
+            "chatgpt-client-test".into(),
+            None,
+            "test-password".into(),
+            "token-signing-secret".into(),
+        );
+        let verifier = "dBjftJeZ4CVP-mB92Kpru-AEJvkQlLgi3ThpmQ45N_Xyo";
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let redirect_uri = "https://chatgpt.com/connector/oauth/test";
+        let redirect = authorize_post(
+            &oauth,
+            AuthorizeForm {
+                client_id: "chatgpt-client-test".into(),
+                redirect_uri: redirect_uri.into(),
+                code_challenge: challenge,
+                code_challenge_method: "S256".into(),
+                state: "state".into(),
+                password: "test-password".into(),
+            },
+            "https://old.trycloudflare.com",
+        );
+        assert_eq!(redirect.status(), StatusCode::SEE_OTHER);
+        let code = {
+            let pending = oauth.pending.lock().expect("lock");
+            pending.keys().next().cloned().expect("authorization code")
+        };
+
+        oauth.set_base_url("https://new.trycloudflare.com");
+        let response = token_exchange(
+            &oauth,
+            &HeaderMap::new(),
+            TokenForm {
+                grant_type: "authorization_code".into(),
+                code,
+                redirect_uri: redirect_uri.into(),
+                code_verifier: verifier.into(),
+                client_id: "chatgpt-client-test".into(),
+                client_secret: String::new(),
+            },
+            "https://new.trycloudflare.com",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("token body");
+        let payload: Value = serde_json::from_slice(&body).expect("token json");
+        let token = payload["access_token"].as_str().expect("access token");
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_audience(&["https://new.trycloudflare.com"]);
+        validation.set_issuer(&["https://new.trycloudflare.com"]);
+        let claims = decode::<TokenClaims>(
+            token,
+            &DecodingKey::from_secret(b"token-signing-secret"),
+            &validation,
+        )
+        .expect("token must be minted for the live tunnel URL");
+        assert_eq!(claims.claims.iss, "https://new.trycloudflare.com");
     }
 }

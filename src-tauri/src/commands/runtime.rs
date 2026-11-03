@@ -15,8 +15,8 @@ use crate::runtime::{
     wait_for_port_free, ServiceKind,
 };
 use crate::tunnel::{
-    append_profile_log, maybe_start_for_runtime, stop_for_runtime, sync_managed_runtime_routes,
-    TunnelServiceKind,
+    append_profile_log, current_running_url, maybe_start_for_runtime, stop_for_runtime,
+    sync_managed_runtime_routes, TunnelServiceKind,
 };
 use crate::workspace::resources::{validate_service_start, WorkspaceService};
 use crate::workspace::RuntimeStatusDto;
@@ -72,6 +72,29 @@ async fn sync_tunnel_routes_from_runtime(state: &AppState) -> AppResult<()> {
     sync_managed_runtime_routes(active_keys).await
 }
 
+/// A live tunnel owns the public address. Quick Tunnels hand out a new
+/// hostname on every launch, so the persisted URL can lag behind reality.
+fn preferred_public_url(running_url: Option<&str>, profile: &crate::workspace::WorkspaceProfile) -> String {
+    match running_url.map(crate::auth::normalize_public_url) {
+        Some(url) if !url.is_empty() => url,
+        _ => profile.effective_public_url(),
+    }
+}
+
+/// Persist the URL shown to GPT and push it into the live MCP listener so its
+/// OAuth metadata stops advertising a retired tunnel.
+fn apply_authoritative_mcp_url(state: &AppState, id: &str, url: &str) -> AppResult<()> {
+    let url = crate::auth::normalize_public_url(url);
+    if url.is_empty() {
+        return Ok(());
+    }
+    persist_tunnel_url(state, id, TunnelServiceKind::Mcp, &url)?;
+    state.with_runtime(|runtime| {
+        runtime.set_mcp_public_url(id, &url);
+        Ok(())
+    })
+}
+
 fn mcp_start_failure(
     state: &AppState,
     profile: &crate::workspace::WorkspaceProfile,
@@ -111,7 +134,11 @@ async fn ensure_port_available(port: u16, service_label: &str) -> AppResult<()> 
     Ok(())
 }
 
-async fn stop_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
+async fn stop_mcp_service(
+    state: &AppState,
+    id: &str,
+    stop_tunnel: bool,
+) -> AppResult<RuntimeStatusDto> {
     let profile = profile_by_id(state, id)?;
     let port = profile.runtime.local_port;
     let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(id, ServiceKind::Mcp)))?;
@@ -120,14 +147,27 @@ async fn stop_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatus
         runtime.finish_stop(id, ServiceKind::Mcp);
         Ok(runtime.mcp_status(&profile))
     })?;
-    stop_for_runtime(&profile, TunnelServiceKind::Mcp).await?;
-    sync_tunnel_routes_from_runtime(state).await?;
+    // Restarting only the listener must keep the tunnel alive: recreating a
+    // Quick Tunnel would rotate its hostname for no reason.
+    if stop_tunnel {
+        stop_for_runtime(&profile, TunnelServiceKind::Mcp).await?;
+        sync_tunnel_routes_from_runtime(state).await?;
+    }
     state.with_runtime(|runtime| Ok(runtime.mcp_status(&profile)))
 }
 
 async fn start_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
     validate_start_resources(state, id, WorkspaceService::Mcp)?;
-    let profile = profile_by_id(state, id)?;
+    let mut profile = profile_by_id(state, id)?;
+
+    // Consult the tunnel that is actually alive before spawning so a restarted
+    // listener never boots against the hostname the tunnel already retired.
+    let live_url = current_running_url(id, TunnelServiceKind::Mcp).await;
+    if let Some(url) = live_url.as_deref() {
+        profile.tunnel.public_url = crate::auth::normalize_public_url(url);
+        apply_authoritative_mcp_url(state, id, &profile.tunnel.public_url)?;
+    }
+
     if state.with_runtime(|runtime| Ok(runtime.is_running(id, ServiceKind::Mcp)))? {
         return state.with_runtime(|runtime| Ok(runtime.mcp_status(&profile)));
     }
@@ -157,15 +197,15 @@ async fn start_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatu
     }
     sync_tunnel_routes_from_runtime(state).await?;
 
-    match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
-        Ok(Some(url)) => {
-            persist_tunnel_url(state, id, TunnelServiceKind::Mcp, &url)?;
-        }
-        Ok(None) => {}
+    let started_url = match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
+        Ok(url) => url,
         Err(error) => {
             eprintln!("mcp tunnel auto-start failed for {id}: {error}");
+            None
         }
-    }
+    };
+    let authoritative = preferred_public_url(started_url.as_deref(), &profile);
+    apply_authoritative_mcp_url(state, id, &authoritative)?;
 
     let profile = profile_by_id(state, id)?;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -215,16 +255,25 @@ async fn start_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeS
 }
 
 /// Async stop→start for MCP. Used by the Tauri command and secret-change hooks.
+/// The tunnel stays up across the restart so its address and OAuth audience
+/// remain stable; it is only rotated when the listener moves to a new port.
 pub(crate) async fn restart_mcp_by_id(
     state: &AppState,
     id: &str,
 ) -> AppResult<RuntimeStatusDto> {
     let _guard = RESTART_GATE.lock().await;
-    let was_running = state.with_runtime(|runtime| {
-        Ok(runtime.is_running(id, ServiceKind::Mcp))
+    let port = profile_by_id(state, id)?.runtime.local_port;
+    let (was_running, running_port) = state.with_runtime(|runtime| {
+        Ok((
+            runtime.is_running(id, ServiceKind::Mcp),
+            runtime.running_local_port(id, ServiceKind::Mcp),
+        ))
     })?;
     if was_running {
-        let _ = stop_mcp_service(state, id).await?;
+        // A tunnel still forwards to the previous port; recreating it is the
+        // only way to reach the new one.
+        let port_changed = running_port.is_some_and(|bound| bound != port);
+        let _ = stop_mcp_service(state, id, port_changed).await?;
     }
     start_mcp_service(state, id).await
 }
@@ -251,7 +300,7 @@ pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<
 
 #[tauri::command]
 pub async fn stop_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
-    stop_mcp_service(&state, &id).await
+    stop_mcp_service(&state, &id, true).await
 }
 
 #[tauri::command]
@@ -305,4 +354,44 @@ pub async fn restart_actions_runtime(
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
     restart_actions_by_id(&state, &id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preferred_public_url;
+    use crate::workspace::WorkspaceProfile;
+
+    fn quick_tunnel_profile(public_url: &str) -> WorkspaceProfile {
+        let mut profile = WorkspaceProfile::new("C:/workspace/test".into(), Some("test".into()));
+        profile.tunnel.tunnel_type = "cloudflare".into();
+        profile.tunnel.public_url = public_url.into();
+        profile
+    }
+
+    #[test]
+    fn running_tunnel_url_wins_over_the_cached_profile_url() {
+        let profile = quick_tunnel_profile("https://old.trycloudflare.com");
+        assert_eq!(
+            preferred_public_url(Some("https://new.trycloudflare.com/"), &profile),
+            "https://new.trycloudflare.com"
+        );
+    }
+
+    #[test]
+    fn cached_url_is_used_when_no_tunnel_is_running() {
+        let profile = quick_tunnel_profile("https://old.trycloudflare.com/");
+        assert_eq!(
+            preferred_public_url(None, &profile),
+            "https://old.trycloudflare.com"
+        );
+    }
+
+    #[test]
+    fn blank_running_url_falls_back_to_the_cached_url() {
+        let profile = quick_tunnel_profile("https://old.trycloudflare.com");
+        assert_eq!(
+            preferred_public_url(Some("  "), &profile),
+            "https://old.trycloudflare.com"
+        );
+    }
 }

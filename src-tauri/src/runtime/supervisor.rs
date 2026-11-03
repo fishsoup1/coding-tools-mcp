@@ -6,6 +6,7 @@ use std::time::Duration;
 use tauri::async_runtime::JoinHandle;
 
 use crate::actions;
+use crate::auth::PublicBaseUrl;
 use crate::error::AppResult;
 use crate::mcp;
 use crate::mcp::upstream::UpstreamMcpManager;
@@ -38,6 +39,8 @@ struct RuntimeEntry {
     phase: RuntimePhase,
     shutdown: Option<mcp::ShutdownSender>,
     handle: Option<JoinHandle<()>>,
+    public_url: Option<PublicBaseUrl>,
+    local_port: u16,
     error_message: Option<String>,
     started_at: Option<std::time::Instant>,
     missing_port_checks: u8,
@@ -82,6 +85,39 @@ impl RuntimeSupervisor {
         )
     }
 
+    /// Point a running MCP listener at the tunnel URL that is actually serving.
+    ///
+    /// Quick tunnels rotate their hostname on every launch; the listener must not
+    /// keep resolving OAuth metadata against the URL captured at startup.
+    /// Returns true when a running listener accepted a different URL.
+    pub fn set_mcp_public_url(&mut self, workspace_id: &str, url: &str) -> bool {
+        let Some(entry) = self
+            .entries
+            .get_mut(&(workspace_id.to_string(), ServiceKind::Mcp))
+        else {
+            return false;
+        };
+        if entry.phase != RuntimePhase::Running {
+            return false;
+        }
+        entry
+            .public_url
+            .as_ref()
+            .is_some_and(|public_url| public_url.set(url))
+    }
+
+    /// Port the running service bound to. Restarting a listener that is still
+    /// reachable through the same tunnel keeps that tunnel alive; a port change
+    /// means the tunnel must be recreated.
+    pub fn running_local_port(&self, workspace_id: &str, kind: ServiceKind) -> Option<u16> {
+        let entry = self.entries.get(&(workspace_id.to_string(), kind))?;
+        if entry.phase == RuntimePhase::Running {
+            Some(entry.local_port)
+        } else {
+            None
+        }
+    }
+
     pub fn refresh_mcp(&mut self, profile: &WorkspaceProfile) {
         self.refresh(profile, ServiceKind::Mcp);
     }
@@ -106,6 +142,8 @@ impl RuntimeSupervisor {
                 phase: RuntimePhase::Error,
                 shutdown: None,
                 handle: None,
+                public_url: None,
+                local_port: profile.runtime.local_port,
                 error_message: Some(message),
                 started_at: None,
                 missing_port_checks: 0,
@@ -232,19 +270,21 @@ impl RuntimeSupervisor {
             )));
         }
 
+        let port = port_for(profile, kind);
         self.entries.insert(
             key.clone(),
             RuntimeEntry {
                 phase: RuntimePhase::Starting,
                 shutdown: None,
                 handle: None,
+                public_url: None,
+                local_port: port,
                 error_message: None,
                 started_at: Some(std::time::Instant::now()),
                 missing_port_checks: 0,
             },
         );
 
-        let port = port_for(profile, kind);
         if let Some(pid) = platform().find_pid_listening_on_port(port)? {
             if is_own_process(pid) {
                 wait_for_port_free_blocking(port, Duration::from_secs(3));
@@ -301,6 +341,7 @@ impl RuntimeSupervisor {
                     profile.runtime.clone(),
                     upstream,
                 )
+                .map(|listener| (listener.shutdown, listener.join, Some(listener.public_url)))
             }
             ServiceKind::Actions => {
                 let auth_type = profile.actions.auth_type.clone();
@@ -358,11 +399,12 @@ impl RuntimeSupervisor {
                     oauth_token_secret,
                     policy,
                 )
+                .map(|(shutdown, join)| (shutdown, join, None))
             }
         };
 
         match spawn_result {
-            Ok((shutdown, handle)) => {
+            Ok((shutdown, join, public_url)) => {
                 let started_at = self
                     .entries
                     .get(&key)
@@ -373,7 +415,9 @@ impl RuntimeSupervisor {
                     RuntimeEntry {
                         phase: RuntimePhase::Running,
                         shutdown: Some(shutdown),
-                        handle: Some(handle),
+                        handle: Some(join),
+                        public_url,
+                        local_port: port,
                         error_message: None,
                         started_at,
                         missing_port_checks: 0,
@@ -396,6 +440,8 @@ impl RuntimeSupervisor {
                         phase: RuntimePhase::Error,
                         shutdown: None,
                         handle: None,
+                        public_url: None,
+                        local_port: port,
                         error_message: Some(err.to_string()),
                         started_at: None,
                         missing_port_checks: 0,
@@ -581,6 +627,8 @@ mod tests {
             phase,
             shutdown: None,
             handle: None,
+            public_url: None,
+            local_port: 28766,
             error_message: None,
             started_at,
             missing_port_checks: 0,
@@ -631,5 +679,66 @@ mod tests {
         let status = supervisor.mcp_status(&profile);
         assert_eq!(status.state, "error");
         assert!(status.local_message.contains("上游初始化失败"));
+    }
+
+    fn running_mcp_entry(public_url: &str) -> RuntimeEntry {
+        RuntimeEntry {
+            phase: RuntimePhase::Running,
+            shutdown: None,
+            handle: None,
+            public_url: Some(PublicBaseUrl::new(public_url)),
+            local_port: 28766,
+            error_message: None,
+            started_at: Some(std::time::Instant::now()),
+            missing_port_checks: 0,
+        }
+    }
+
+    #[test]
+    fn set_mcp_public_url_updates_a_running_listener() {
+        let mut supervisor = RuntimeSupervisor::default();
+        let key = ("ws".to_string(), ServiceKind::Mcp);
+        supervisor
+            .entries
+            .insert(key.clone(), running_mcp_entry("https://old.trycloudflare.com"));
+
+        assert!(supervisor.set_mcp_public_url("ws", "https://new.trycloudflare.com"));
+
+        assert_eq!(
+            supervisor
+                .entries
+                .get(&key)
+                .and_then(|entry| entry.public_url.as_ref())
+                .map(|public_url| public_url.current()),
+            Some("https://new.trycloudflare.com".to_string())
+        );
+        assert!(!supervisor.set_mcp_public_url("ws", "https://new.trycloudflare.com"));
+    }
+
+    #[test]
+    fn set_mcp_public_url_ignores_non_running_runtimes() {
+        let mut supervisor = RuntimeSupervisor::default();
+        supervisor
+            .entries
+            .insert(("ws".to_string(), ServiceKind::Mcp), entry(RuntimePhase::Starting, None));
+
+        assert!(!supervisor.set_mcp_public_url("ws", "https://new.trycloudflare.com"));
+        assert!(!supervisor.set_mcp_public_url("missing", "https://new.trycloudflare.com"));
+    }
+
+    #[test]
+    fn running_local_port_is_only_reported_for_running_runtimes() {
+        let mut supervisor = RuntimeSupervisor::default();
+        supervisor.entries.insert(
+            ("ws".to_string(), ServiceKind::Mcp),
+            running_mcp_entry("https://old.trycloudflare.com"),
+        );
+
+        assert_eq!(
+            supervisor.running_local_port("ws", ServiceKind::Mcp),
+            Some(28766)
+        );
+        assert_eq!(supervisor.running_local_port("missing", ServiceKind::Mcp), None);
+        assert_eq!(supervisor.running_local_port("ws", ServiceKind::Actions), None);
     }
 }
